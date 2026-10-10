@@ -1,0 +1,16 @@
+# secrets and environment
+.env
+venv/
+__pycache__/
+*.pyc
+
+# my own notes
+notes.txt
+
+# kit files and data, not part of the submission
+sample_data/
+sample_seed.py
+PROBLEM_STATEMENT.docx
+openapi.yaml
+DATA_MODEL.md
+test_conn.py
