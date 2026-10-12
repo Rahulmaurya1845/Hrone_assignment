@@ -4,6 +4,7 @@ Employee Attendance & Analytics API
 Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 """
+import calendar
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -11,7 +12,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -108,6 +109,76 @@ def compute_overtime(punch_out: datetime, shift_start: str, shift_end: str, date
     return minutes if minutes >= 30 else 0
 
 
+def derive_fields(status: str, pin: Optional[datetime], pout: Optional[datetime], emp: dict, d: str) -> dict:
+    """The four derived fields, recomputed from the final status and punch times (R2-R5)."""
+    if status in ("ABSENT", "LEAVE") or pin is None:
+        return {"work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    late = compute_late_minutes(pin, emp["shift_start"], d)
+    if pout is None:
+        return {"work_hours": None, "late_minutes": late, "overtime_minutes": 0, "half_day": False}
+    wh = compute_work_hours(pin, pout)
+    return {
+        "work_hours": wh,
+        "late_minutes": late,
+        "overtime_minutes": compute_overtime(pout, emp["shift_start"], emp["shift_end"], d),
+        "half_day": wh < 4.5,
+    }
+
+
+PRESENT_STATUSES = ["PRESENT", "WFH", "ON_DUTY"]
+MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
+def month_bounds(month: str) -> tuple:
+    """'2026-07' -> (date(2026,7,1), date(2026,7,31)). 422 for impossible years like 0000."""
+    try:
+        y, m = int(month[:4]), int(month[5:7])
+        return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+    except ValueError:
+        raise HTTPException(422, f"invalid month: {month}")
+
+
+def count_weekdays(start: date, end: date) -> int:
+    """Number of Mon-Fri days from start to end, both included (R7: no holiday calendar)."""
+    if end < start:
+        return 0
+    days = (end - start).days + 1
+    full_weeks, rest = divmod(days, 7)
+    count = full_weeks * 5
+    for i in range(rest):
+        if (start + timedelta(days=i)).weekday() < 5:
+            count += 1
+    return count
+
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list:
+    """One group over the employee's records of the month. MongoDB does all the counting."""
+    present_weight = {
+        "$cond": [
+            {"$and": [
+                {"$in": ["$status", PRESENT_STATUSES]},
+                # R7: only Mon-Fri records count as present days ($isoDayOfWeek: 1=Mon ... 7=Sun)
+                {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date"}}}, 5]},
+            ]},
+            # R5: a half day counts as 0.5. Missing half_day (legacy record) means false.
+            {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
+            0,
+        ]
+    }
+    late = {"$ifNull": ["$late_minutes", 0]}
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": f"{month}-01", "$lte": f"{month}-31"}}},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": present_weight},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [late, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": late},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
 def attendance_out(doc: dict) -> dict:
     """Turn a MongoDB attendance document into the API shape (no _id, times in ms)."""
     history = []
@@ -189,6 +260,15 @@ class PunchInIn(BaseModel):
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMs] = None
+
+
+class RegularizeIn(BaseModel):
+    # derived fields (work_hours, late_minutes, ...) are not declared, so they are ignored
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
 
 
 # --------------------------------------------------------------------------- #
@@ -309,6 +389,112 @@ def punch_out(body: PunchOutIn):
     return attendance_out(rec)
 
 
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(
+    emp_code: str,
+    body: RegularizeIn,
+    att_date: str = Path(alias="date", pattern=DATE_PATTERN),
+):
+    check_date(att_date)
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": att_date})
+    if rec is None:
+        raise HTTPException(404, "no attendance record for that date")
+
+    # state before the change (legacy records may miss some fields)
+    old = {
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes", 0),
+        "overtime_minutes": rec.get("overtime_minutes", 0),
+        "half_day": rec.get("half_day", False),
+    }
+
+    # state after the change: omitted fields stay as they are
+    new_status = body.status or old["status"]
+    if new_status in ("ABSENT", "LEAVE"):
+        if body.punch_in is not None or body.punch_out is not None:
+            raise HTTPException(422, "ABSENT/LEAVE clear the punch times; do not send them")
+        new_in = new_out = None
+    else:
+        new_in = from_ms(body.punch_in).replace(microsecond=0) if body.punch_in is not None else old["punch_in"]
+        new_out = from_ms(body.punch_out).replace(microsecond=0) if body.punch_out is not None else old["punch_out"]
+        if new_in is None:
+            raise HTTPException(422, "a presence status needs a punch_in")
+        if body.punch_in is not None and attendance_date(new_in, emp["shift_start"], emp["shift_end"]) != att_date:
+            raise HTTPException(422, "punch_in must stay on the record's attendance date")
+        if new_out is not None:
+            if new_out <= new_in:
+                raise HTTPException(422, "punch_out must be after punch_in")
+            if new_out - new_in > timedelta(hours=24):
+                raise HTTPException(422, "punch_out is more than 24 hours after punch_in")
+
+    if (new_status, new_in, new_out) == (old["status"], old["punch_in"], old["punch_out"]):
+        raise HTTPException(422, "this request changes nothing")
+
+    new = {"status": new_status, "punch_in": new_in, "punch_out": new_out}
+    new.update(derive_fields(new_status, new_in, new_out, emp, att_date))
+
+    # history lists only the fields that actually changed
+    changes = {k: {"from": old[k], "to": new[k]} for k in new if new[k] != old[k]}
+    now = datetime.now(timezone.utc)
+    entry = {
+        "at": now.replace(microsecond=now.microsecond // 1000 * 1000),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    # Optimistic lock: history never shrinks, so "no element at index n" means nobody
+    # else corrected this record since we read it. If someone did, we lose with 409.
+    n = len(rec.get("history", []))
+    res = db.attendance_logs.update_one(
+        {"_id": rec["_id"], f"history.{n}": {"$exists": False}, "punch_out": old["punch_out"]},
+        {"$set": new, "$push": {"history": entry}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(409, "record was changed by someone else, please retry")
+
+    rec.update(new)
+    rec["history"] = rec.get("history", []) + [entry]
+    return attendance_out(rec)
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTERN)):
+    first, last = month_bounds(month)
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    # R7: working days are counted from joined_on for someone who joined mid-month
+    start = max(first, date.fromisoformat(emp["joined_on"]))
+    working_days = count_weekdays(start, last)
+
+    rows = list(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, month)))
+    r = rows[0] if rows else {}
+    present = Decimal(str(r.get("present_days", 0)))
+
+    pct = None
+    if working_days > 0:  # R8: 2 decimals, half-up
+        pct = float(round_half_up(present / Decimal(working_days) * 100, 2))
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": float(round_half_up(present, 2)),
+        "leave_days": r.get("leave_days", 0),
+        "late_count": r.get("late_count", 0),
+        "total_late_minutes": r.get("total_late_minutes", 0),
+        "total_overtime_minutes": r.get("total_overtime_minutes", 0),
+        "attendance_pct": pct,
+    }
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -348,8 +534,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
