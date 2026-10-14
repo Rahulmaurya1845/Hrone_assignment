@@ -1,9 +1,29 @@
 # REVIEW.md
 
-List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
+Defects I found in the starter `app/main.py`, how I noticed each one, and how I fixed it.
 
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
 |---|---|---|---|---|
-| 1 | | | | |
+| 1 | `compute_late_minutes` | Measures from `punch_in.replace(hour, minute)`, so it uses the punch-in's own date and its (naive, server-time) clock. It also floors to whole minutes before testing `> 10`. | Shift 09:30, punch-in 09:40:01 returns 0 (R2 wants 10). On a UTC server a 09:40 IST punch (04:10 UTC) returns 0. Overnight shift 22:00, punch-in 02:00 returns 0 instead of 240. | Build the shift start in IST on the record's attendance date. Late only when the gap is more than 600 seconds; then return `seconds // 60`. |
+| 2 | `compute_work_hours` | Python `round()` on a float. Not half-up (R4). | 9630 seconds is exactly 2.675 hours. The starter returns 2.67, R4 wants 2.68. | `Decimal` with `ROUND_HALF_UP`, computed from whole seconds. |
+| 3 | `compute_overtime` | No 30-minute minimum. Always puts shift end on the record date, which is wrong for overnight shifts. Subtracts a naive `punch_out` from an aware `end`, which raises `TypeError`. | Punch-out 5 minutes after shift end returns 5 (R3 wants 0). Overnight 22:00-06:00, punch-out 06:40 returns about 24 hours 40 minutes. | End is on the attendance date (plus one day if overnight). Floor minutes; return them only when 30 or more. All datetimes are timezone-aware. |
+| 4 | `MongoClient(...)` | Default is naive datetimes, so stored UTC punch times come back with no zone. | Converting or comparing a stored `punch_in` depends on the server's local zone. | `tz_aware=True`, UTC. Convert to and from epoch milliseconds at the API edge with integer maths (`to_ms`, `from_ms`). |
+| 5 | `health` | Always returns ok. | Stop MongoDB: still 200. The contract wants 503. | Ping MongoDB; return 503 on `PyMongoError`. |
+| 6 | `EmployeeIn` model | Every field is a plain `str`, so there is no validation. | `emp_code "ABC"`, `email "x"`, `shift_start "25:99"`, `joined_on "hello"`, equal shift times and an empty name all return 201. The contract wants 422. | `Field` patterns and lengths from the contract, a real-date check for `joined_on`, a model validator so the shifts differ. |
+| 7 | `create_employee` (duplicate check) | `find_one` then `insert_one`, with no unique index. | Two simultaneous requests with the same `emp_code` can both succeed. | Unique index on `emp_code` at startup; catch `DuplicateKeyError` and return 409. |
+| 8 | `create_employee` (`created_at`) | Stores naive `datetime.now()` and returns it as ISO text. | Response shows a date string in server-local time, not epoch milliseconds. | UTC datetime cut to milliseconds; the response returns epoch milliseconds. |
+| 9 | `list_employees` | `skip = page * page_size`, so page 1 skips the first page. `total` ignores the department filter. No sort. No limits on `page` or `page_size`. | `page=1&page_size=2` returns employees 3 and 4. `department=X` shows the total of all employees. `page_size=100000` is accepted. | `skip = (page - 1) * page_size`; `count_documents(q)`; sort by `emp_code`; `Query(ge=1)` and `Query(ge=1, le=100)`. |
+| 10 | `punch_in` (unknown employee) | Does not check that `find_one` found an employee, then reads `emp["shift_start"]`. | `POST {"emp_code": "EMP9999"}` returns 500 (`TypeError`). The contract wants 404. | Return 404 when the employee is `None`. |
+| 11 | `PunchInIn` / `punch_in` (input) | `status` is a plain string and `punched_at` is a plain int with no range. `if body.punched_at` treats 0 as missing. | `status "hello"` or `"ABSENT"` is accepted. `punched_at 1788235801` (seconds) is accepted and lands in 1970. | `status` is a `Literal` of PRESENT, WFH, ON_DUTY. `punched_at` is a strict int in the millisecond range, compared with `is not None`. Bad values give 422. |
+| 12 | `punch_in` (date and zone) | `datetime.fromtimestamp` and `datetime.now()` use the server's local zone. The date comes from that local time. Seconds are not cut. The overnight rule (R1) is missing. | On a UTC server a punch at 00:30 IST gets the previous day's date. Overnight punch-in at 02:00 gets the wrong day. | Work in UTC; the date is the IST calendar date with the overnight rule (`attendance_date`); instants are cut to whole seconds. |
+| 13 | `punch_in` (duplicate check) | `find_one` then `insert_one`, with no unique index. | Parallel requests for the same employee and date can all return 201. | Unique index on (`emp_code`, `date`); catch `DuplicateKeyError` and return 409. |
+| 14 | `punch_in` (response) | Adds an `id` from the ObjectId and returns `punch_in` as a datetime. | Response has an `id` field and an ISO date string. The contract forbids ids and wants epoch milliseconds. | `attendance_out` builds exactly the contract's shape. |
+| 15 | `list_attendance` (scale) | Loads the whole collection into memory, sorts in Python and slices. No index. | With 100,000 records it is slow and memory-heavy. | `count_documents` plus `find().sort().skip().limit()` in MongoDB, backed by an index on (`date` descending, `emp_code`). |
+| 16 | `list_attendance` (contract) | Sorts by `date` only. No validation. Returns raw documents. | Same-date order is arbitrary (should be `emp_code` ascending). `page_size=1000`, `date_from` after `date_to` and `status=hello` are accepted. Older records without `half_day` or `history` come back without them. | Sort (`date` -1, `emp_code` 1); 422 for bad page, size, dates or status; `attendance_out` fills missing fields (`half_day` false, `history` empty). |
+| 17 | Whole app | No indexes are created. | Every filter and sort scans the collection. | Indexes are created at startup (see DECISIONS.md). |
 
-Also note anything you looked at and decided was **not** a defect, and why.
+## Looked at and decided it was fine
+- `load_dotenv()` does not override real environment variables, so injected `MONGO_URI` and `MONGO_DB` win, as required.
+- `IST = timezone(timedelta(hours=5, minutes=30))` is correct: India has no daylight saving.
+- `create_employee` popping `_id` after `insert_one` is needed, because the driver adds it. The `{"_id": 0}` projection in `list_employees` is also correct.
+- 201 for creates and the 409 for a duplicate are the right codes; the problem was only how the duplicate was detected.

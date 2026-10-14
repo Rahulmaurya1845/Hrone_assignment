@@ -1,4 +1,4 @@
-# Candidate kit
+<!-- # Candidate kit
 
 Read in this order:
 
@@ -23,4 +23,31 @@ MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free t
 
 ## Submit
 A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+No `.env`, no secrets, no Dockerfile. -->
+
+
+# Employee Attendance & Analytics API
+
+FastAPI + MongoDB. All code is in `app/main.py`.
+
+## Run
+```bash
+python -m venv venv
+venv\Scripts\activate            # Windows (Mac/Linux: source venv/bin/activate)
+pip install -r requirements.txt
+```
+Set `MONGO_URI` and `MONGO_DB` as environment variables (a local `.env` file is also read, and real environment variables take priority), then:
+```bash
+uvicorn app.main:app --port 8000
+```
+Indexes are created at startup, so no manual steps are needed. `GET /health` returns 200 when MongoDB answers.
+
+## Status
+All endpoints in the contract are implemented: employees, punch-in, punch-out, regularization (PATCH) with history, attendance list, the four analytics endpoints and `/admin/explain/{endpoint}`. Nothing is knowingly missing.
+
+## Things to know
+- Instants are stored as UTC datetimes and exchanged as epoch milliseconds; dates and shift times are IST strings.
+- Race conditions (punch-in, punch-out, PATCH) rely on a unique index and conditional updates. I reasoned about them and tested the sequential cases, but did not run a parallel load test.
+- I tested the analytics on MongoDB Atlas (version 8.0) with the sample data plus my own cases (ties, a weekend, an empty range, an overnight shift). I did not test with 100,000 records; `/admin/explain` shows `IXSCAN` and no `COLLSCAN` on my small data.
+- The queries use index hints so MongoDB keeps using the intended index on wide filters.
+- For the trend, the 7-day moving average uses the reported (rounded to 4 decimals) `attendance_rate` values.
